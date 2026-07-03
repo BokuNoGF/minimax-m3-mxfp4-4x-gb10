@@ -1,0 +1,158 @@
+# =============================================================================
+# vLLM nightly for MiniMax-M3 (MXFP4) on 4x NVIDIA DGX Spark / GB10 (SM121)
+# =============================================================================
+# Base: vllm/vllm-openai:nightly  — PINNED to the exact commit we validated.
+#   Unpinned "nightly" moves; this SHA is the one that serves MiniMax-M3-MXFP4
+#   correctly on GB10. Bump deliberately, then re-test the whole stack.
+#
+# Baked in:
+#   - Ray 2.44.1
+#   - cutlass_dsl admissible_archs SM12x + SM12x attention-backend patches
+#   - NCCL 2.30.4 (bundled 2.28.9 hangs multi-node collectives on GB10)
+#   - ALL MiniMax-M3 runtime fixes: mods/fix-minimax-m3-sm121/run.sh is executed at BUILD
+#     time (CUDA headers, fmha_sm12x, MXFP8 oracle/assert, api_server, MXFP4 SwiGLU clamp).
+#     Because nothing is patched at container start, the container runs ROOTLESS — no
+#     `--rootful`, which keeps the HF cache user-owned and avoids sparkrun rsync EPERM.
+#
+# Already in this nightly (no patching needed):
+#   - PR #45718 (streaming reasoning by text markers)
+#   - DelegatingParser fix (abstract_parser.py)
+#   - is_reasoning_end() fix (prompt tail check)
+#   - PR #44495 (ZMQ port TOCTOU race fix)
+#   - CUTLASS_MLA SM12x, TRITON_MLA decode block size, CutlassFp8BlockScaled disable
+#   - MiniMax-M3 model + minimax_m3 reasoning/tool parsers
+#
+# Build:
+#   docker build --no-cache -t vllm-m3-mxfp4-sm121:latest -f Dockerfile.m3-sm121 .
+# =============================================================================
+
+FROM vllm/vllm-openai:nightly-93d8f834dd8acf33eb0e2a75b2711b628cb6e226
+
+# -- Python: Ray 2.44.1 --
+RUN set -eux; \
+    pip install --no-cache-dir --upgrade "ray[default]==2.44.1"; \
+    python3 -c "import importlib.metadata as m; print('ray:', m.version('ray'))"
+
+# -- Patch: SM12x attention backends (heredoc to avoid Docker quoting issues) --
+RUN python3 << 'PYEOF'
+import os
+
+patches = []
+
+# CUTLASS_MLA + FLASHMLA + FLASH_ATTN_MLA accept sm_12x
+for rel in ['vllm/v1/attention/backends/cuda.py']:
+    for base in ['/opt/vllm', '/usr/local/lib/python3.12/dist-packages']:
+        path = os.path.join(base, rel)
+        if not os.path.exists(path):
+            continue
+        text = open(path).read()
+        orig = text
+        text = text.replace(
+            'if major == 10 and minor == 0:',
+            'if major in (10, 12):  # patched: accept SM12x (GB10)',
+        )
+        if text != orig:
+            open(path, 'w').write(text)
+            patches.append(f'CUTLASS_MLA SM12x: {path}')
+
+# TRITON_MLA decode block size for GB10 shmem limit
+for rel in ['vllm/v1/attention/ops/triton_decode_attention.py']:
+    for base in ['/opt/vllm', '/usr/local/lib/python3.12/dist-packages']:
+        path = os.path.join(base, rel)
+        if not os.path.exists(path):
+            continue
+        text = open(path).read()
+        orig = text
+        text = text.replace(
+            'if is_hip_ and Lk >= 576:',
+            'if Lk >= 576:  # patched: GB10 sm_121 has same shmem limit as MI3xx',
+        )
+        if text != orig:
+            open(path, 'w').write(text)
+            patches.append(f'TRITON_MLA block size: {path}')
+
+# cutlass_dsl admissible_archs include sm_120a + sm_121a
+for rel in ['nvidia_cutlass_dsl/python_packages/cutlass/cute/nvgpu/tcgen05/mma.py']:
+    for base in ['/usr/local/lib/python3.12/dist-packages', '/opt/vllm/.deps/cutlass-src/python/CuTeDSL']:
+        path = os.path.join(base, rel)
+        if not os.path.exists(path):
+            continue
+        text = open(path).read()
+        orig = text
+        old = 'admissible_archs = [\n        Arch.sm_100a,\n        Arch.sm_103a,\n    ]'
+        new = 'admissible_archs = [\n        Arch.sm_100a,\n        Arch.sm_103a,\n        Arch.sm_120a,  # patched: GB10 / DGX Spark\n        Arch.sm_121a,  # patched: GB10 / DGX Spark\n    ]'
+        text = text.replace(old, new)
+        if text != orig:
+            open(path, 'w').write(text)
+            patches.append(f'cutlass_dsl admissible_archs: {path}')
+
+# Disable CutlassFp8BlockScaledMMKernel on SM12x
+for rel in ['vllm/model_executor/layers/quantization/utils/fp8_utils.py']:
+    for base in ['/opt/vllm', '/usr/local/lib/python3.12/dist-packages']:
+        path = os.path.join(base, rel)
+        if not os.path.exists(path):
+            continue
+        text = open(path).read()
+        orig = text
+        old = '    def is_supported(cls) -> bool:\n        return current_platform.has_device_capability(100)'
+        new = (
+            '    def is_supported(cls) -> bool:\n'
+            '        cap = current_platform.get_device_capability()\n'
+            '        if cap and cap[0] == 12:\n'
+            '            return False\n'
+            '        return current_platform.has_device_capability(100)'
+        )
+        text = text.replace(old, new)
+        if text != orig:
+            open(path, 'w').write(text)
+            patches.append(f'CutlassFp8BlockScaledMMKernel SM12x disable: {path}')
+
+if patches:
+    print('Applied SM12x patches:')
+    for p in patches:
+        print(f'  - {p}')
+else:
+    print('No SM12x patches needed')
+PYEOF
+
+# -- Bake in NCCL 2.30.4 (from the official cu13 aarch64 wheel) --
+# The base image bundles NCCL 2.28.9, which HANGS multi-node collectives on GB10.
+# Pull the CUDA-13 build of 2.30.4 and extract its libnccl.so.2 to /opt/nccl-2.30.4,
+# which the recipe LD_PRELOADs. Build on aarch64 (the Spark, or buildx --platform
+# linux/arm64) so pip resolves the aarch64 wheel.
+RUN set -eux; \
+    pip install --no-cache-dir --no-deps --target /tmp/nccl-pkg nvidia-nccl-cu13==2.30.4; \
+    mkdir -p /opt/nccl-2.30.4; \
+    cp -aL /tmp/nccl-pkg/nvidia/nccl/lib/. /opt/nccl-2.30.4/; \
+    ln -sf /opt/nccl-2.30.4/libnccl.so.2 /opt/nccl-2.30.4/libnccl.so; \
+    rm -rf /tmp/nccl-pkg; \
+    test -f /opt/nccl-2.30.4/libnccl.so.2; \
+    echo "NCCL 2.30.4 (cu13) baked at /opt/nccl-2.30.4/"
+# If NCCL fails to init on GB10 (missing sm_121 device code), build from source with
+#   make src.build NVCC_GENCODE="-gencode=arch=compute_121,code=sm_121"  and copy the .so here.
+
+# -- Set TORCH_CUDA_ARCH_LIST for SM121 --
+ENV TORCH_CUDA_ARCH_LIST=12.1a
+ENV FLASHINFER_CUDA_ARCH_LIST=12.1a
+
+# -- Bake the MiniMax-M3 SM121 runtime fixes into the image --
+# Runs the SAME patches as mods/fix-minimax-m3-sm121/run.sh (CUDA headers, fmha_sm12x,
+# MXFP8 oracle/assert, api_server, MXFP4 SwiGLU clamp) at BUILD time. Because the container
+# then needs no runtime site-packages patching, it can run ROOTLESS (no --rootful) — which
+# keeps the HF cache owned by your user and avoids sparkrun's rsync EPERM on root-owned
+# .no_exist markers. (The mods/ dir is kept in the repo as the source of these patches.)
+COPY mods/fix-minimax-m3-sm121 /opt/m3-mod
+RUN set -eux; bash /opt/m3-mod/run.sh; rm -rf /opt/m3-mod
+
+# -- Cleanup --
+RUN set -eux; \
+    find /usr/local/lib/python3.12/dist-packages/vllm -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null || true; \
+    rm -rf /root/.cache/pip /tmp/*; \
+    echo "Cleanup done"
+
+# sparkrun launches `<image> bash -c "<serve cmd>"`; keep ENTRYPOINT out of the way.
+# (Also set executor_config.entrypoint: "" in the recipe as belt-and-suspenders.)
+ENTRYPOINT []
+
+LABEL target.arch="sm_121a"
+LABEL description="vLLM nightly (pinned 93d8f834) for MiniMax-M3 MXFP4 on GB10 (SM121), Ray, SM12x attn"

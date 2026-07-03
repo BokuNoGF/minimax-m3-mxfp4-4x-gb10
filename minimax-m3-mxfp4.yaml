@@ -1,0 +1,107 @@
+recipe_version: "1"
+name: MiniMax-M3-MXFP4
+description: "MiniMax-M3 MXFP4 @ TP=4 on 4x DGX Spark (GB10/sm121), EAGLE3, stock vLLM nightly + fix-minimax-m3-sm121 mod"
+
+model: olka-fi/MiniMax-M3-MXFP4
+container: vllm-m3-mxfp4-sm121:latest        # build from Dockerfile.m3-sm121 (pinned nightly)
+
+cluster_only: true
+# NOTE: no `mods:` — the SM121 fixes are BAKED into the image at build time
+# (Dockerfile.m3-sm121 runs mods/fix-minimax-m3-sm121/run.sh). This means the container
+# needs no runtime site-packages patching, so run WITHOUT `--rootful` (rootless keeps the
+# HF cache owned by your user and avoids sparkrun's rsync EPERM on root-owned .no_exist files).
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 4                   # 4 nodes x 1 GB10 = TP4 (64/4 heads, 4/4 kv -> clean, no padding)
+  pipeline_parallel: 1
+  gpu_memory_utilization: 0.82
+  block_size: 128                      # REQUIRED by M3 sparse attention (index_block_size=128)
+  max_model_len: 262144
+  max_num_batched_tokens: 4096
+  max_num_seqs: 5
+  served_model_name: 'olka-fi/MiniMax-M3-MXFP4'
+
+env:
+  # --- NCCL 2.30.4 (REQUIRED): bundled 2.28.9 hangs multi-node collectives on GB10.
+  # Baked into the image at /opt/nccl-2.30.4 by Dockerfile.m3-sm121 (pip nvidia-nccl-cu13==2.30.4).
+  LD_PRELOAD: /opt/nccl-2.30.4/libnccl.so.2
+  LD_LIBRARY_PATH: /opt/nccl-2.30.4
+  # --- arch / build ---
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"
+  TILELANG_CLEANUP_TEMP_FILES: "1"
+  TORCH_CUDA_ARCH_LIST: "12.1a"
+  FLASHINFER_CUDA_ARCH_LIST: "12.1a"
+  # --- caches on the (writable) mounted HF cache (container runs non-root) ---
+  TORCHINDUCTOR_CACHE_DIR: /cache/huggingface/torchinductor-cache
+  TRITON_CACHE_DIR: /cache/huggingface/triton-cache
+  TORCH_EXTENSIONS_DIR: /cache/huggingface/torch_extensions
+  VLLM_CACHE_ROOT: /cache/huggingface/vllm-cache
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  # --- NCCL over the ConnectX-7 RoCE fabric (switched, common subnet) ---
+  NCCL_NET: "IB"
+  NCCL_IB_DISABLE: "0"
+  NCCL_DEBUG: "WARN"
+  NCCL_ASYNC_ERROR_HANDLING: "1"
+  NCCL_BLOCKING_WAIT: "0"
+  NCCL_IB_ROCE_VERSION_NUM: "2"
+  NCCL_IB_QPS_PER_CONNECTION: "8"       # load both PCIe-domain 100G MACs / parallel QPs
+  NCCL_IB_SPLIT_DATA_ON_QPS: "1"
+  NCCL_MIN_NCHANNELS: "32"
+  NCCL_IB_PCI_RELAXED_ORDERING: "1"
+  NCCL_IB_MERGE_NICS: "1"
+  NCCL_NET_PLUGIN: "none"
+  NCCL_TIMEOUT: "1800"
+  # --- Ray / vLLM ---
+  RAY_memory_monitor_refresh_ms: "0"
+  RAY_object_store_memory: "1073741824"
+  RAY_CGRAPH_get_timeout: "18000"
+  VLLM_LOAD_FORMAT: "safetensors"
+  VLLM_USE_RAY_V2_EXECUTOR_BACKEND: "1"
+  VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: "1"   # overlap cross-node comm with compute
+  VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
+  # --- HF cache. Target model is distributed by sparkrun; the EAGLE3 draft is NOT synced,
+  # so it auto-downloads on each node at load time (requires node internet to huggingface.co).
+  # NOTE: sparkrun sets HF_HUB_OFFLINE=1 by DEFAULT — you must explicitly set it to "0"
+  # here to let nodes fetch the draft (just omitting it leaves sparkrun's "1" in place). ---
+  HF_HOME: /cache/huggingface
+  HF_HUB_OFFLINE: "0"
+  TRANSFORMERS_OFFLINE: "0"
+  OMP_NUM_THREADS: "8"
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  PYTHONUNBUFFERED: "1"
+
+executor_config:
+  entrypoint: ""        # neutralize the base image's `vllm serve` ENTRYPOINT
+  auto_remove: false    # keep crashed containers for `docker logs` post-mortem
+
+# NOTE: do NOT add --kv-cache-dtype fp8 — it forces FlashInfer, which conflicts with
+# M3's 128-block sparse attention ("No common block size for 128") and is incorrect
+# past ~2K tokens on sm121. Keep the default (bf16) KV.
+command: |
+  vllm serve {model} \
+      --trust-remote-code \
+      -tp {tensor_parallel} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --block-size {block_size} \
+      --max-model-len {max_model_len} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --max-num-seqs {max_num_seqs} \
+      --enable-prefix-caching \
+      --served-model-name {served_model_name} \
+      --host {host} \
+      --port {port} \
+      --distributed-executor-backend ray \
+      --no-enable-expert-parallel \
+      --load-format safetensors \
+      --tool-call-parser minimax_m3 \
+      --reasoning-parser minimax_m3 \
+      --limit-mm-per-prompt '{"image":6,"video":0}' \
+      --enable-auto-tool-choice \
+      --generation-config vllm \
+      --enable-flashinfer-autotune \
+      --default-chat-template-kwargs '{"thinking_mode":"enabled","keep_all_reasoning":true}' \
+      --speculative-config '{"model":"Inferact/MiniMax-M3-EAGLE3","num_speculative_tokens":2,"method":"eagle3","draft_tensor_parallel_size":1,"attention_backend":"TRITON_ATTN"}' \
+      --mm-encoder-tp-mode data \
+      --performance-mode balanced
