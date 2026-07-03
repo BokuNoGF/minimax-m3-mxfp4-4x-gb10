@@ -48,7 +48,6 @@ env:
   NCCL_IB_ROCE_VERSION_NUM: "2"
   NCCL_IB_QPS_PER_CONNECTION: "8"       # load both PCIe-domain 100G MACs / parallel QPs
   NCCL_IB_SPLIT_DATA_ON_QPS: "1"
-  NCCL_MIN_NCHANNELS: "32"
   NCCL_IB_PCI_RELAXED_ORDERING: "1"
   NCCL_TIMEOUT: "1800"
   # --- Ray / vLLM ---
